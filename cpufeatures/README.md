@@ -70,7 +70,7 @@ pub mod x86_dispatch {
         backend;
         Avx2: "avx2", "aes";
         Aes: "aes", "sse4.1";
-        Soft;
+        _ => Soft;
     );
 
     use backend::Features;
@@ -92,8 +92,7 @@ pub mod x86_dispatch {
 
 Sets are probed in the order in which they are declared and the first fully available one
 is selected, so they should be listed from the most to the least preferred. The trailing
-entry carries no target features and names the variant returned when none of the sets is
-available.
+`_ => <variant>` entry names the variant returned when none of the sets is available.
 
 If all target features of the *first* set are enabled via compiler options, it is always
 the selected one, so detection and the atomic load are eliminated entirely.

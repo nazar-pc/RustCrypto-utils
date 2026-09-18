@@ -52,10 +52,10 @@ compile_error!("This crate works only on `aarch64`, `loongarch64`, `x86`, and `x
 ///
 /// # Multiple target feature sets
 ///
-/// Several named sets can be declared instead, separated with `;`. The module then gets a
-/// `Features` enum with one variant per set and `get` returns the first variant whose target
-/// features are all available. The trailing entry carries no target features and names the
-/// variant returned when none of the sets is available.
+/// Several named sets can be declared instead, separated with `;` and followed by a
+/// `_ => <variant>` entry naming the variant used when none of them is available. The module
+/// then gets a `Features` enum with one variant per entry and `get` returns the first variant
+/// whose target features are all available.
 ///
 /// Detection is performed once for all sets and cached in a single atomic variable, so
 /// dispatch costs one relaxed load instead of one per set.
@@ -67,7 +67,7 @@ compile_error!("This crate works only on `aarch64`, `loongarch64`, `x86`, and `x
 ///     backend;
 ///     Avx2: "avx2", "aes";
 ///     Aes: "aes", "sse4.1";
-///     Soft;
+///     _ => Soft;
 /// );
 ///
 /// use backend::Features;
@@ -156,39 +156,16 @@ macro_rules! new {
             }
         }
     };
-    ($mod_name:ident; $($sets:tt)*) => {
-        $crate::__new_multi!(@collect [$mod_name] [] $($sets)*);
-    };
-}
-
-/// Collect the target feature sets passed to `new!` into a list of `[$variant: $($tf),+]`
-/// groups and emit the detection module.
-///
-/// `new!` can not match the sets and the trailing fallback variant name in a single rule,
-/// since both start with an `ident` fragment, which is a local ambiguity.
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __new_multi {
-    (@collect [$mod_name:ident] [$($sets:tt)*] $variant:ident: $($tf:tt),+; $($rest:tt)*) => {
-        $crate::__new_multi!(@collect [$mod_name] [$($sets)* [$variant: $($tf),+]] $($rest)*);
-    };
-    (@collect [$mod_name:ident] [$($sets:tt)*] $fallback:ident $(;)?) => {
-        $crate::__new_multi!(@emit [$mod_name] [$($sets)*] [$fallback]);
-    };
-    (@collect [$mod_name:ident] [$($sets:tt)*]) => {
-        compile_error!(
-            "`cpufeatures::new!` expects a trailing variant name for the case when none of \
-             the target feature sets is available"
-        );
-    };
-    (@emit [$mod_name:ident] [] [$fallback:ident]) => {
-        compile_error!("`cpufeatures::new!` expects at least one target feature set");
-    };
+    // The first set is matched separately from the rest only because `STATICALLY_DETECTED`
+    // below needs its target features on their own. The fallback entry is introduced by `_`
+    // rather than by a bare variant name because `$:ident` does not match `_`; were it a bare
+    // name, the matcher could not tell it apart from one more set and would reject the whole
+    // invocation with a local ambiguity error.
     (
-        @emit
-        [$mod_name:ident]
-        [[$first_variant:ident: $($first_tf:tt),+] $([$variant:ident: $($tf:tt),+])*]
-        [$fallback:ident]
+        $mod_name:ident;
+        $first_variant:ident: $($first_tf:tt),+;
+        $($variant:ident: $($tf:tt),+;)*
+        _ => $fallback:ident $(;)?
     ) => {
         mod $mod_name {
             use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
@@ -265,15 +242,21 @@ macro_rules! __new_multi {
 
             #[cold]
             fn init_inner() -> Features {
-                let res = if $crate::__unless_target_features! {
-                    $($first_tf),+ => { $crate::__detect_target_features!($($first_tf),+) }
-                } {
-                    Features::$first_variant
-                } $(else if $crate::__unless_target_features! {
-                    $($tf),+ => { $crate::__detect_target_features!($($tf),+) }
-                } {
-                    Features::$variant
-                })* else {
+                let res = 'detect: {
+                    if $crate::__unless_target_features! {
+                        $($first_tf),+ => { $crate::__detect_target_features!($($first_tf),+) }
+                    } {
+                        break 'detect Features::$first_variant;
+                    }
+
+                    $(
+                        if $crate::__unless_target_features! {
+                            $($tf),+ => { $crate::__detect_target_features!($($tf),+) }
+                        } {
+                            break 'detect Features::$variant;
+                        }
+                    )*
+
                     Features::$fallback
                 };
 
@@ -317,5 +300,14 @@ macro_rules! __new_multi {
                 init_get().1
             }
         }
+    };
+    ($mod_name:ident; _ => $fallback:ident $(;)?) => {
+        compile_error!("`cpufeatures::new!` expects at least one target feature set");
+    };
+    ($mod_name:ident; $($variant:ident: $($tf:tt),+;)+) => {
+        compile_error!(
+            "`cpufeatures::new!` expects a trailing `_ => <variant>;` entry naming the \
+             variant used when none of the target feature sets is available"
+        );
     };
 }

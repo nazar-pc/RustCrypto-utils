@@ -21,7 +21,7 @@ cpufeatures::new!(
     Sha3Aes: "sha3", "aes";
     Sha2Aes: "sha2", "aes";
     Aes: "aes";
-    Soft;
+    _ => Soft;
 );
 
 cpufeatures::new!(armcaps_sha3_aes, "sha3", "aes");
