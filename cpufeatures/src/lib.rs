@@ -31,6 +31,56 @@ mod miri;
 compile_error!("This crate works only on `aarch64`, `loongarch64`, `x86`, and `x86-64` targets.");
 
 /// Create module with CPU feature detection code.
+///
+/// # Single target feature set
+///
+/// The module gets a `get` function returning whether all listed target features are
+/// available:
+///
+/// ```
+/// # #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// # fn main() {
+/// cpufeatures::new!(aes_sha, "aes", "sha");
+///
+/// if aes_sha::get() {
+///     // ...
+/// }
+/// # }
+/// # #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+/// # fn main() {}
+/// ```
+///
+/// # Multiple target feature sets
+///
+/// Several named sets can be declared instead, separated with `;`. The module then gets a
+/// `Features` enum with one variant per set and `get` returns the first variant whose target
+/// features are all available. The trailing entry carries no target features and names the
+/// variant returned when none of the sets is available.
+///
+/// Detection is performed once for all sets and cached in a single atomic variable, so
+/// dispatch costs one relaxed load instead of one per set.
+///
+/// ```
+/// # #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// # fn main() {
+/// cpufeatures::new!(
+///     backend;
+///     Avx2: "avx2", "aes";
+///     Aes: "aes", "sse4.1";
+///     Soft;
+/// );
+///
+/// use backend::Features;
+///
+/// match backend::get() {
+///     Features::Avx2 => { /* ... */ }
+///     Features::Aes => { /* ... */ }
+///     Features::Soft => { /* ... */ }
+/// }
+/// # }
+/// # #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+/// # fn main() {}
+/// ```
 #[macro_export]
 macro_rules! new {
     ($mod_name:ident, $($tf:tt),+ $(,)?) => {
@@ -102,6 +152,168 @@ macro_rules! new {
             /// Initialize underlying storage if needed and get stored value.
             #[inline]
             pub fn get() -> bool {
+                init_get().1
+            }
+        }
+    };
+    ($mod_name:ident; $($sets:tt)*) => {
+        $crate::__new_multi!(@collect [$mod_name] [] $($sets)*);
+    };
+}
+
+/// Collect the target feature sets passed to `new!` into a list of `[$variant: $($tf),+]`
+/// groups and emit the detection module.
+///
+/// `new!` can not match the sets and the trailing fallback variant name in a single rule,
+/// since both start with an `ident` fragment, which is a local ambiguity.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __new_multi {
+    (@collect [$mod_name:ident] [$($sets:tt)*] $variant:ident: $($tf:tt),+; $($rest:tt)*) => {
+        $crate::__new_multi!(@collect [$mod_name] [$($sets)* [$variant: $($tf),+]] $($rest)*);
+    };
+    (@collect [$mod_name:ident] [$($sets:tt)*] $fallback:ident $(;)?) => {
+        $crate::__new_multi!(@emit [$mod_name] [$($sets)*] [$fallback]);
+    };
+    (@collect [$mod_name:ident] [$($sets:tt)*]) => {
+        compile_error!(
+            "`cpufeatures::new!` expects a trailing variant name for the case when none of \
+             the target feature sets is available"
+        );
+    };
+    (@emit [$mod_name:ident] [] [$fallback:ident]) => {
+        compile_error!("`cpufeatures::new!` expects at least one target feature set");
+    };
+    (
+        @emit
+        [$mod_name:ident]
+        [[$first_variant:ident: $($first_tf:tt),+] $([$variant:ident: $($tf:tt),+])*]
+        [$fallback:ident]
+    ) => {
+        mod $mod_name {
+            use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
+
+            /// Target feature set detected at runtime.
+            ///
+            /// Variants are ordered as declared, i.e. the detected one is always the first
+            /// variant whose target features are all available.
+            #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+            #[repr(u8)]
+            pub enum Features {
+                #[doc = concat!("Available target features:", $(" `", $first_tf, "`",)+)]
+                $first_variant,
+                $(
+                    #[doc = concat!("Available target features:", $(" `", $tf, "`",)+)]
+                    $variant,
+                )*
+                /// None of the declared target feature sets is available.
+                $fallback,
+            }
+
+            // Value stored in `STORAGE` until CPU feature detection has been performed.
+            //
+            // `Features` is `#[repr(u8)]` and does not use explicit discriminants, so its
+            // tags are exactly `0..=$fallback` and the value right past the last variant can
+            // not collide with any of them.
+            const UNINIT: u8 = Features::$fallback as u8 + 1;
+
+            // Every `Features` tag has to stay below `UNINIT`, otherwise `init_get` could not
+            // tell the uninitialized state apart and the transmutes below would be unsound.
+            const _: () = {
+                assert!((Features::$first_variant as u8) < UNINIT);
+                $(assert!((Features::$variant as u8) < UNINIT);)*
+                assert!((Features::$fallback as u8) < UNINIT);
+            };
+
+            // Set when all target features of the first declared set are enabled at compile
+            // time. That set is probed first, so it is then always the detected one and no
+            // runtime detection is necessary.
+            const STATICALLY_DETECTED: bool = cfg!(all($(target_feature = $first_tf,)+));
+
+            static STORAGE: AtomicU8 = AtomicU8::new(UNINIT);
+
+            /// Initialization token
+            #[derive(Copy, Clone, Debug)]
+            pub struct InitToken(());
+
+            impl InitToken {
+                /// Initialize token, performing CPU feature detection.
+                pub fn init() -> Self {
+                    init()
+                }
+
+                /// Initialize token and return the detected target feature set.
+                pub fn init_get() -> (Self, Features) {
+                    init_get()
+                }
+
+                /// Get initialized value.
+                #[inline(always)]
+                pub fn get(&self) -> Features {
+                    if STATICALLY_DETECTED {
+                        Features::$first_variant
+                    } else {
+                        let val = STORAGE.load(Relaxed);
+
+                        // SAFETY: `InitToken` can only be obtained from `init_get`, which
+                        // stores the tag of a valid `Features` value into `STORAGE` before
+                        // constructing the token, and the tag is never modified afterwards.
+                        unsafe { core::mem::transmute::<u8, Features>(val) }
+                    }
+                }
+            }
+
+            #[cold]
+            fn init_inner() -> Features {
+                let res = if $crate::__unless_target_features! {
+                    $($first_tf),+ => { $crate::__detect_target_features!($($first_tf),+) }
+                } {
+                    Features::$first_variant
+                } $(else if $crate::__unless_target_features! {
+                    $($tf),+ => { $crate::__detect_target_features!($($tf),+) }
+                } {
+                    Features::$variant
+                })* else {
+                    Features::$fallback
+                };
+
+                STORAGE.store(res as u8, Relaxed);
+
+                res
+            }
+
+            /// Get detected target feature set and initialization token,
+            /// initializing underlying storage if needed.
+            #[inline]
+            pub fn init_get() -> (InitToken, Features) {
+                let res = if STATICALLY_DETECTED {
+                    Features::$first_variant
+                } else {
+                    // Relaxed ordering is fine, as we only have a single atomic variable.
+                    let val = STORAGE.load(Relaxed);
+
+                    if val == UNINIT {
+                        init_inner()
+                    } else {
+                        // SAFETY: `STORAGE` contains either `UNINIT`, which is handled
+                        // above, or the tag of a valid `Features` value written by
+                        // `init_inner`.
+                        unsafe { core::mem::transmute::<u8, Features>(val) }
+                    }
+                };
+
+                (InitToken(()), res)
+            }
+
+            /// Initialize underlying storage if needed and get initialization token.
+            #[inline]
+            pub fn init() -> InitToken {
+                init_get().0
+            }
+
+            /// Initialize underlying storage if needed and get detected target feature set.
+            #[inline]
+            pub fn get() -> Features {
                 init_get().1
             }
         }
