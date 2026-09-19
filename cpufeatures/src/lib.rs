@@ -225,13 +225,23 @@ macro_rules! new {
                 $(assert!((Features::$variant as u8) < UNINIT);)*
             };
 
-            // Set when all target features of the first declared set are enabled at compile
-            // time. That set is probed first, so it is then always the detected one and no
-            // runtime detection is necessary. Indexing picks it out of the list built from
-            // all entries, so that it does not have to be matched apart from the rest.
+            // Set when the detected variant follows from compile-time information alone,
+            // which happens in two cases: the first declared set is enabled at compile time,
+            // as it is probed first and therefore always wins, and the target having no
+            // runtime detection at all, where no set beyond the enabled ones can ever be
+            // found. Either way no storage is involved and `init_inner` never runs.
             const STATICALLY_DETECTED: Option<Features> = {
-                if [$(cfg!(all($($(target_feature = $tf,)+)?))),+][0] {
-                    Some([$(Features::$variant),+][0])
+                // The last entry declares no target features, so it is always enabled and
+                // terminates the search below.
+                let enabled = [$(cfg!(all($($(target_feature = $tf,)+)?))),+];
+
+                if enabled[0] || !$crate::__runtime_detection_available!() {
+                    let mut i = 0;
+                    while !enabled[i] {
+                        i += 1;
+                    }
+
+                    Some([$(Features::$variant),+][i])
                 } else {
                     None
                 }

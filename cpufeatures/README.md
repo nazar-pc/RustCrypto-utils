@@ -96,7 +96,9 @@ entry carries no target features and names the variant returned when none of the
 available.
 
 If all target features of the *first* set are enabled via compiler options, it is always
-the selected one, so detection and the atomic load are eliminated entirely.
+the selected one, so detection and the atomic load are eliminated entirely. The same happens
+on targets without runtime detection, such as SGX, UEFI and freestanding ones, where the
+selected set follows from the compiler options alone.
 
 ## Supported target architectures
 
