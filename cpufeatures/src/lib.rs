@@ -52,10 +52,10 @@ compile_error!("This crate works only on `aarch64`, `loongarch64`, `x86`, and `x
 ///
 /// # Multiple target feature sets
 ///
-/// Several named sets can be declared instead, separated with `;` and followed by a
-/// `_ => <variant>` entry naming the variant used when none of them is available. The module
-/// then gets a `Features` enum with one variant per entry and `get` returns the first variant
-/// whose target features are all available.
+/// Several named sets can be declared instead, separated with `;`. The module then gets a
+/// `Features` enum with one variant per set and `get` returns the first variant whose target
+/// features are all available. The trailing entry carries no target features and names the
+/// variant returned when none of the sets is available.
 ///
 /// Detection is performed once for all sets and cached in a single atomic variable, so
 /// dispatch costs one relaxed load instead of one per set.
@@ -67,7 +67,7 @@ compile_error!("This crate works only on `aarch64`, `loongarch64`, `x86`, and `x
 ///     backend;
 ///     Avx2: "avx2", "aes";
 ///     Aes: "aes", "sse4.1";
-///     _ => Soft;
+///     Soft;
 /// );
 ///
 /// use backend::Features;
@@ -156,17 +156,30 @@ macro_rules! new {
             }
         }
     };
-    // The first set is matched separately from the rest only because `STATICALLY_DETECTED`
-    // below needs its target features on their own. The fallback entry is introduced by `_`
-    // rather than by a bare variant name because `$:ident` does not match `_`; were it a bare
-    // name, the matcher could not tell it apart from one more set and would reject the whole
-    // invocation with a local ambiguity error.
-    (
-        $mod_name:ident;
-        $first_variant:ident: $($first_tf:tt),+;
-        $($variant:ident: $($tf:tt),+;)*
-        _ => $fallback:ident $(;)?
-    ) => {
+    ($mod_name:ident; $($sets:tt)*) => {
+        $crate::__new_multi!([$mod_name] [] $($sets)*);
+    };
+}
+
+/// Collect the target feature sets of the multi-set `new!` form into `[$variant: $($tf),+]`
+/// groups and emit the detection module once the trailing fallback variant name is reached.
+///
+/// `new!` can not do this in a single rule: at the fallback name the matcher can either start
+/// one more set or finish the list, and because both alternatives bind an `ident` it rejects
+/// the invocation as a local ambiguity rather than deferring the choice. Rules are tried one
+/// after another, so peeling a single set off the front per step sidesteps that.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __new_multi {
+    // One more set to collect.
+    ([$mod_name:ident] [$($sets:tt)*] $variant:ident: $($tf:tt),+; $($rest:tt)*) => {
+        $crate::__new_multi!([$mod_name] [$($sets)* [$variant: $($tf),+]] $($rest)*);
+    };
+    ([$mod_name:ident] [] $fallback:ident $(;)?) => {
+        compile_error!("`cpufeatures::new!` expects at least one target feature set");
+    };
+    // A name that is not followed by target features terminates the list.
+    ([$mod_name:ident] [$([$variant:ident: $($tf:tt),+])*] $fallback:ident $(;)?) => {
         mod $mod_name {
             use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
@@ -177,8 +190,6 @@ macro_rules! new {
             #[derive(Copy, Clone, Debug, Eq, PartialEq)]
             #[repr(u8)]
             pub enum Features {
-                #[doc = concat!("Available target features:", $(" `", $first_tf, "`",)+)]
-                $first_variant,
                 $(
                     #[doc = concat!("Available target features:", $(" `", $tf, "`",)+)]
                     $variant,
@@ -197,15 +208,21 @@ macro_rules! new {
             // Every `Features` tag has to stay below `UNINIT`, otherwise `init_get` could not
             // tell the uninitialized state apart and the transmutes below would be unsound.
             const _: () = {
-                assert!((Features::$first_variant as u8) < UNINIT);
                 $(assert!((Features::$variant as u8) < UNINIT);)*
                 assert!((Features::$fallback as u8) < UNINIT);
             };
 
             // Set when all target features of the first declared set are enabled at compile
             // time. That set is probed first, so it is then always the detected one and no
-            // runtime detection is necessary.
-            const STATICALLY_DETECTED: bool = cfg!(all($(target_feature = $first_tf,)+));
+            // runtime detection is necessary. Indexing picks it out of the lists built from
+            // all sets, so that it does not have to be matched apart from the rest.
+            const STATICALLY_DETECTED: Option<Features> = {
+                if [$(cfg!(all($(target_feature = $tf,)+))),+][0] {
+                    Some([$(Features::$variant),+][0])
+                } else {
+                    None
+                }
+            };
 
             static STORAGE: AtomicU8 = AtomicU8::new(UNINIT);
 
@@ -227,15 +244,16 @@ macro_rules! new {
                 /// Get initialized value.
                 #[inline(always)]
                 pub fn get(&self) -> Features {
-                    if STATICALLY_DETECTED {
-                        Features::$first_variant
-                    } else {
-                        let val = STORAGE.load(Relaxed);
+                    match STATICALLY_DETECTED {
+                        Some(features) => features,
+                        None => {
+                            let val = STORAGE.load(Relaxed);
 
-                        // SAFETY: `InitToken` can only be obtained from `init_get`, which
-                        // stores the tag of a valid `Features` value into `STORAGE` before
-                        // constructing the token, and the tag is never modified afterwards.
-                        unsafe { core::mem::transmute::<u8, Features>(val) }
+                            // SAFETY: `InitToken` can only be obtained from `init_get`, which
+                            // stores the tag of a valid `Features` value into `STORAGE` before
+                            // constructing the token, and the tag is never modified afterwards.
+                            unsafe { core::mem::transmute::<u8, Features>(val) }
+                        }
                     }
                 }
             }
@@ -243,12 +261,6 @@ macro_rules! new {
             #[cold]
             fn init_inner() -> Features {
                 let res = 'detect: {
-                    if $crate::__unless_target_features! {
-                        $($first_tf),+ => { $crate::__detect_target_features!($($first_tf),+) }
-                    } {
-                        break 'detect Features::$first_variant;
-                    }
-
                     $(
                         if $crate::__unless_target_features! {
                             $($tf),+ => { $crate::__detect_target_features!($($tf),+) }
@@ -269,19 +281,20 @@ macro_rules! new {
             /// initializing underlying storage if needed.
             #[inline]
             pub fn init_get() -> (InitToken, Features) {
-                let res = if STATICALLY_DETECTED {
-                    Features::$first_variant
-                } else {
-                    // Relaxed ordering is fine, as we only have a single atomic variable.
-                    let val = STORAGE.load(Relaxed);
+                let res = match STATICALLY_DETECTED {
+                    Some(features) => features,
+                    None => {
+                        // Relaxed ordering is fine, as we only have a single atomic variable.
+                        let val = STORAGE.load(Relaxed);
 
-                    if val == UNINIT {
-                        init_inner()
-                    } else {
-                        // SAFETY: `STORAGE` contains either `UNINIT`, which is handled
-                        // above, or the tag of a valid `Features` value written by
-                        // `init_inner`.
-                        unsafe { core::mem::transmute::<u8, Features>(val) }
+                        if val == UNINIT {
+                            init_inner()
+                        } else {
+                            // SAFETY: `STORAGE` contains either `UNINIT`, which is handled
+                            // above, or the tag of a valid `Features` value written by
+                            // `init_inner`.
+                            unsafe { core::mem::transmute::<u8, Features>(val) }
+                        }
                     }
                 };
 
@@ -301,13 +314,10 @@ macro_rules! new {
             }
         }
     };
-    ($mod_name:ident; _ => $fallback:ident $(;)?) => {
-        compile_error!("`cpufeatures::new!` expects at least one target feature set");
-    };
-    ($mod_name:ident; $($variant:ident: $($tf:tt),+;)+) => {
+    ([$mod_name:ident] [$($sets:tt)*]) => {
         compile_error!(
-            "`cpufeatures::new!` expects a trailing `_ => <variant>;` entry naming the \
-             variant used when none of the target feature sets is available"
+            "`cpufeatures::new!` expects a trailing variant name for the case when none of \
+             the target feature sets is available"
         );
     };
 }

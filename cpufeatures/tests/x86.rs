@@ -21,7 +21,7 @@ cpufeatures::new!(
     AesSha: "aes", "sha";
     Aes: "aes";
     Sse2: "sse2";
-    _ => Soft;
+    Soft;
 );
 
 cpufeatures::new!(cpuid_aes, "aes");
