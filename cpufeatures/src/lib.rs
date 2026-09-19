@@ -156,68 +156,81 @@ macro_rules! new {
             }
         }
     };
-    ($mod_name:ident; $($sets:tt)*) => {
-        $crate::__new_multi!([$mod_name] [] $($sets)*);
-    };
-}
-
-/// Collect the target feature sets of the multi-set `new!` form into `[$variant: $($tf),+]`
-/// groups and emit the detection module once the trailing fallback variant name is reached.
-///
-/// `new!` can not do this in a single rule: at the fallback name the matcher can either start
-/// one more set or finish the list, and because both alternatives bind an `ident` it rejects
-/// the invocation as a local ambiguity rather than deferring the choice. Rules are tried one
-/// after another, so peeling a single set off the front per step sidesteps that.
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __new_multi {
-    // One more set to collect.
-    ([$mod_name:ident] [$($sets:tt)*] $variant:ident: $($tf:tt),+; $($rest:tt)*) => {
-        $crate::__new_multi!([$mod_name] [$($sets)* [$variant: $($tf),+]] $($rest)*);
-    };
-    ([$mod_name:ident] [] $fallback:ident $(;)?) => {
-        compile_error!("`cpufeatures::new!` expects at least one target feature set");
-    };
-    // A name that is not followed by target features terminates the list.
-    ([$mod_name:ident] [$([$variant:ident: $($tf:tt),+])*] $fallback:ident $(;)?) => {
+    // Every entry has the same shape, a name optionally followed by target features, so that
+    // the matcher never has to decide between starting one more set and finishing the list.
+    // Spelling the trailing entry out as a bare name in its own position instead would be a
+    // local ambiguity, as both alternatives bind an `ident`.
+    ($mod_name:ident; $($variant:ident $(: $($tf:tt),+)?);+ $(;)?) => {
         mod $mod_name {
             use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
             /// Target feature set detected at runtime.
             ///
             /// Variants are ordered as declared, i.e. the detected one is always the first
-            /// variant whose target features are all available.
+            /// variant whose target features are all available. The last variant declares no
+            /// target features and is the one detected when no other is available.
             #[derive(Copy, Clone, Debug, Eq, PartialEq)]
             #[repr(u8)]
             pub enum Features {
                 $(
-                    #[doc = concat!("Available target features:", $(" `", $tf, "`",)+)]
+                    #[doc = concat!("The `", stringify!($variant), "` target feature set.")]
+                    $(
+                        #[doc = concat!("\nAvailable target features:", $(" `", $tf, "`",)+)]
+                    )?
                     $variant,
                 )*
-                /// None of the declared target feature sets is available.
-                $fallback,
             }
+
+            // Whether each entry declares target features. `!$tf.is_empty()` is a constant
+            // `true` whose only purpose is to depend on `$tf`, so that the term is emitted
+            // exactly for the entries that have one.
+            const HAS_TARGET_FEATURES: &[bool] = &[$(false $($(|| !$tf.is_empty())+)?),+];
+
+            const _: () = {
+                let len = HAS_TARGET_FEATURES.len();
+
+                assert!(len > 1, "`cpufeatures::new!` expects at least one target feature set");
+                assert!(
+                    !HAS_TARGET_FEATURES[len - 1],
+                    "the last `cpufeatures::new!` entry names the variant detected when none \
+                     of the target feature sets is available and must not declare any itself"
+                );
+
+                let mut i = 0;
+                while i < len - 1 {
+                    assert!(
+                        HAS_TARGET_FEATURES[i],
+                        "only the last `cpufeatures::new!` entry may omit target features"
+                    );
+                    i += 1;
+                }
+            };
+
+            /// Variant detected when none of the target feature sets is available.
+            const FALLBACK: Features = {
+                let all = [$(Features::$variant),+];
+                all[all.len() - 1]
+            };
 
             // Value stored in `STORAGE` until CPU feature detection has been performed.
             //
             // `Features` is `#[repr(u8)]` and does not use explicit discriminants, so its
-            // tags are exactly `0..=$fallback` and the value right past the last variant can
+            // tags are exactly `0..=FALLBACK` and the value right past the last variant can
             // not collide with any of them.
-            const UNINIT: u8 = Features::$fallback as u8 + 1;
+            const UNINIT: u8 = FALLBACK as u8 + 1;
 
             // Every `Features` tag has to stay below `UNINIT`, otherwise `init_get` could not
             // tell the uninitialized state apart and the transmutes below would be unsound.
             const _: () = {
                 $(assert!((Features::$variant as u8) < UNINIT);)*
-                assert!((Features::$fallback as u8) < UNINIT);
             };
 
             // Set when all target features of the first declared set are enabled at compile
             // time. That set is probed first, so it is then always the detected one and no
-            // runtime detection is necessary. Indexing picks it out of the lists built from
-            // all sets, so that it does not have to be matched apart from the rest.
+            // runtime detection is necessary. Indexing picks it out of the list built from
+            // all entries, so that it does not have to be matched apart from the rest.
             const STATICALLY_DETECTED: Option<Features> = {
-                if [$(cfg!(all($(target_feature = $tf,)+))),+][0] {
+                if [$(cfg!(all($($(target_feature = $tf,)+)?))),+][0] {
                     Some([$(Features::$variant),+][0])
                 } else {
                     None
@@ -261,15 +274,15 @@ macro_rules! __new_multi {
             #[cold]
             fn init_inner() -> Features {
                 let res = 'detect: {
-                    $(
+                    $($(
                         if $crate::__unless_target_features! {
                             $($tf),+ => { $crate::__detect_target_features!($($tf),+) }
                         } {
                             break 'detect Features::$variant;
                         }
-                    )*
+                    )?)*
 
-                    Features::$fallback
+                    FALLBACK
                 };
 
                 STORAGE.store(res as u8, Relaxed);
@@ -313,11 +326,5 @@ macro_rules! __new_multi {
                 init_get().1
             }
         }
-    };
-    ([$mod_name:ident] [$($sets:tt)*]) => {
-        compile_error!(
-            "`cpufeatures::new!` expects a trailing variant name for the case when none of \
-             the target feature sets is available"
-        );
     };
 }
